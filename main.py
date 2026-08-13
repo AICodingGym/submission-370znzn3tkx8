@@ -50,9 +50,10 @@ warnings.filterwarnings("ignore")
 # ╚═══════════════════════════════════════════════════════════════╝
 # 预设模式：
 #   "smoke" : 冒烟测试，固定 500样本/2fold/1epoch/2seed，~10分钟验证流程
-#   "base"  : DeBERTa-v3-base，3 seeds，2xT4 约 3-4h，预期 0.82-0.83
+#   "fast"  : base + 关checkpointing，配下面 1seed/3epoch，2xT4 约 40-60min，~0.80
+#   "base"  : DeBERTa-v3-base，3 seeds，2xT4 约 2-3h，预期 0.82-0.83
 #   "large" : DeBERTa-v3-large，最佳效果，3 seeds，2xT4 约 8-9h，预期 0.84-0.85
-EDIT_PRESET = "smoke"          # ← 改这里切换模式
+EDIT_PRESET = "large"          # ← 改这里切换模式
 
 # 集成 seeds（仅 base/large 生效；smoke 固定 2 个）
 # 每个 seed 跑完都会存一份可交的 submission.csv，设 3 个只赚不亏。
@@ -65,25 +66,43 @@ EDIT_MAX_LENGTH = 1024         # 多数作文<500 token；想加速可改 512
 EDIT_LR = 2e-5
 EDIT_BATCH_SIZE = None         # None = 预设默认(base=4, large=2)；OOM 时调小
 EDIT_NO_AMP = False            # True = 关混合精度（仅 AMP 反复报错时用）
+EDIT_HF_OFFLINE = True         # True = 只读本地缓存不联网（模型已下载后设True，避免SSL抖动）
 # ╔═══════════════════════════════════════════════════════════════╗
 # ║  ★ 编辑区结束，下面一般不用动                                  ║
 # ╚═══════════════════════════════════════════════════════════════╝
 
 # ============================================================
-# Early Kaggle detection — set HF cache BEFORE any model load
+# Environment detection — set HF cache BEFORE any model load
 # ============================================================
 
 _KAGGLE = os.path.exists("/kaggle/working") and os.path.exists("/kaggle/input")
+# All paths below are relative to the current working directory. On Kaggle we
+# override to the writable /kaggle/working dir; elsewhere (e.g. a 4090 box at
+# /root/wzt) relative paths resolve against the project folder.
 _LOG_DIR = "/kaggle/working" if _KAGGLE else "."
 _LOG_FILE = os.path.join(_LOG_DIR, "training.log")
 
-# Reduce CUDA memory fragmentation — helps avoid OOM on T4 (15GB) with long sequences.
-os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+# Reduce CUDA memory fragmentation — the correct env var (note: _CUDA_) helps avoid
+# OOM with long sequences. Must be set before any CUDA context is created.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-if _KAGGLE:
-    os.environ["HF_HOME"] = "/kaggle/working/.cache/huggingface"
-    os.environ["TRANSFORMERS_CACHE"] = "/kaggle/working/.cache/huggingface"
-    os.makedirs(os.environ["HF_HOME"], exist_ok=True)
+# HF cache: relative on local boxes, /kaggle/working on Kaggle.
+_HF_CACHE = "/kaggle/working/.cache/huggingface" if _KAGGLE else "./.cache/huggingface"
+os.environ["HF_HOME"] = _HF_CACHE
+os.environ["TRANSFORMERS_CACHE"] = _HF_CACHE
+# If model is already downloaded, force offline so from_pretrained never pings HF
+# (avoids flaky SSL on the cache-validity HEAD check). Toggle via EDIT_HF_OFFLINE.
+if EDIT_HF_OFFLINE:
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    print("[config] HF_HUB_OFFLINE=1 (using local cache only, no network)")
+# Longer timeout for large model downloads over flaky networks (default 10s is too short).
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
+# If huggingface.co is unreachable (e.g. CN networks), point at a mirror:
+#   set HF_ENDPOINT=https://hf-mirror.com   (or EDIT_HF_ENDPOINT below)
+if os.environ.get("HF_ENDPOINT"):
+    print(f"[config] HF_ENDPOINT = {os.environ['HF_ENDPOINT']}")
+os.makedirs(_HF_CACHE, exist_ok=True)
 
 
 # ============================================================
@@ -159,11 +178,11 @@ sys.excepthook = _log_exception
 class Config:
     """Central configuration — override via CLI flags."""
 
-    # --- Paths ---
-    data_dir: str = "/kaggle/input/datasets/arkria/lalaes2"
-    output_dir: str = "/kaggle/working"
-    submission_file: str = "/kaggle/working/submission.csv"
-    cache_dir: str = "/kaggle/working/.cache/huggingface"
+    # --- Paths (relative to CWD; overridden to /kaggle/working on Kaggle) ---
+    data_dir: str = "./data"
+    output_dir: str = "./output"
+    submission_file: str = "./output/submission.csv"
+    cache_dir: str = "./.cache/huggingface"
 
     # --- Model ---
     model_name: str = "microsoft/deberta-v3-base"
@@ -351,12 +370,37 @@ def optimize_thresholds(y_true: np.ndarray, y_cont: np.ndarray, n_restarts: int 
 # ============================================================
 
 
+def _load_with_retry(load_fn, *args, label: str = "resource", retries: int = 8,
+                     delay: float = 8.0, **kwargs):
+    """Generic retry wrapper for HF downloads — SSL/network flakes are common and
+    usually succeed on retry. Once anything loads, the files are cached locally."""
+    import time
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            obj = load_fn(*args, **kwargs)
+            # First successful download → switch to offline so later folds/epochs
+            # never re-hit the network (avoids flaky SSL on cache-validity checks).
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            return obj
+        except Exception as e:
+            last_err = e
+            # Re-enable online for the next retry attempt
+            os.environ.pop("HF_HUB_OFFLINE", None)
+            print(f"  [retry {attempt}/{retries}] {label} download failed: {type(e).__name__}: {e}")
+            if attempt < retries:
+                time.sleep(delay)
+    raise RuntimeError(f"{label} failed to load after {retries} attempts") from last_err
+
+
 def safe_load_tokenizer(model_name: str, retries: int = 3):
     """Load tokenizer with retry on network failures."""
+    offline = os.environ.get("HF_HUB_OFFLINE") == "1"
+    action = "Loading tokenizer from cache" if offline else "Downloading tokenizer"
     cache_info = f"HF_HOME={os.environ.get('HF_HOME', 'default')}"
     for attempt in range(1, retries + 1):
         try:
-            print(f"  Downloading tokenizer for {model_name} ... [{cache_info}]")
+            print(f"  {action} for {model_name} ... [{cache_info}]")
             tokenizer = AutoTokenizer.from_pretrained(model_name)
             tokenizer.add_special_tokens({"additional_special_tokens": ["[NEWLINE]"]})
             print(f"  Tokenizer loaded OK (vocab={len(tokenizer)})")
@@ -490,11 +534,15 @@ class EssayScoringModel(nn.Module):
     def __init__(self, model_name: str, num_classes: int = 6, dropout: float = 0.1,
                  gradient_checkpointing: bool = False):
         super().__init__()
-        self.config = AutoConfig.from_pretrained(model_name)
+        self.config = _load_with_retry(AutoConfig.from_pretrained, model_name,
+                                       label=f"config({model_name})")
         self.config.hidden_dropout_prob = dropout
         self.config.attention_probs_dropout_prob = dropout
 
-        self.backbone = AutoModel.from_pretrained(model_name, config=self.config, torch_dtype=torch.float32)
+        self.backbone = _load_with_retry(
+            AutoModel.from_pretrained, model_name,
+            label=f"weights({model_name})", config=self.config, torch_dtype=torch.float32,
+        )
         # Hard guarantee: force ALL params/buffers to FP32. microsoft/deberta-v3-* may
         # load as FP16 from the hub; under AMP that yields FP16 grads and crashes
         # GradScaler.unscale_ ("Attempting to unscale FP16 gradients").
@@ -566,9 +614,13 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, 
     # makes GradScaler.unscale_ raise "Attempting to unscale FP16 gradients". This is cheap.
     model.float()
     total_loss = 0.0
+    run_loss = 0.0  # running loss for periodic logging
     optimizer.zero_grad(set_to_none=True)
+    n_steps = len(dataloader)
+    log_interval = max(1, n_steps // 10)  # print ~10 loss lines per epoch
 
-    for step, batch in enumerate(tqdm(dataloader, desc="Training", leave=False)):
+    pbar = tqdm(dataloader, desc="Training", leave=False)
+    for step, batch in enumerate(pbar):
         input_ids = batch["input_ids"].to(config.device)
         attention_mask = batch["attention_mask"].to(config.device)
         labels = batch["label"].to(config.device)
@@ -585,7 +637,17 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, criterion, scaler, 
             loss = loss / config.gradient_accumulation_steps
             loss.backward()
 
-        total_loss += loss.item() * config.gradient_accumulation_steps
+        step_loss = loss.item() * config.gradient_accumulation_steps
+        total_loss += step_loss
+        run_loss += step_loss
+
+        # Live loss in the progress bar + periodic line to stdout (→ train.log)
+        pbar.set_postfix(loss=f"{step_loss:.4f}", avg=f"{total_loss/(step+1):.4f}")
+        if (step + 1) % log_interval == 0:
+            recent = run_loss / log_interval
+            print(f"    step {step+1}/{n_steps} | "
+                  f"recent_loss={recent:.4f} | avg_loss={total_loss/(step+1):.4f}")
+            run_loss = 0.0
 
         if (step + 1) % config.gradient_accumulation_steps == 0:
             try:
@@ -650,9 +712,12 @@ def probabilities_to_scores(probs: np.ndarray) -> np.ndarray:
 # ============================================================
 
 
-def train_single_model(train_input_ids, train_attention_masks, scores_list, tokenizer, config, fold_seeds=None):
+def train_single_model(train_input_ids, train_attention_masks, scores_list,
+                       test_input_ids, test_attention_masks, tokenizer, config, fold_seeds=None):
     """
-    Train DeBERTa with 5-fold CV on PRE-TOKENIZED data, return OOF probabilities and thresholds.
+    Train DeBERTa with 5-fold CV on PRE-TOKENIZED data.
+    Returns OOF probs, TEST probs (averaged across the N fold models — no separate
+    full-data retrain needed), optimized thresholds, and OOF QWK.
     """
     score_ints = np.array(scores_list, dtype=int)
     n = len(train_input_ids)
@@ -660,6 +725,15 @@ def train_single_model(train_input_ids, train_attention_masks, scores_list, toke
 
     skf = StratifiedKFold(n_splits=config.n_folds, shuffle=True, random_state=config.seed)
     oof_probs = np.zeros((n, config.num_classes), dtype=np.float32)
+    # Accumulate test predictions from each fold model (ensemble of the N fold models).
+    test_probs_sum = np.zeros((len(test_input_ids), config.num_classes), dtype=np.float32)
+
+    eff_bs = config.batch_size * config.world_size
+    test_dataset = EssayDataset(test_input_ids, test_attention_masks)
+    test_loader = DataLoader(
+        test_dataset, batch_size=eff_bs * 2, shuffle=False,
+        num_workers=config.num_workers, pin_memory=True, collate_fn=collate,
+    )
 
     for fold, (train_idx, val_idx) in enumerate(skf.split(range(n), score_ints)):
         print(f"\n{'='*50}")
@@ -729,6 +803,9 @@ def train_single_model(train_input_ids, train_attention_masks, scores_list, toke
         fold_probs = predict(model, val_loader, config)
         oof_probs[val_idx] = fold_probs
 
+        # Predict test with this fold's best model; accumulate (ensemble across folds).
+        test_probs_sum += predict(model, test_loader, config)
+
         fold_cont = probabilities_to_scores(fold_probs)
         fold_preds = np.round(fold_cont).clip(1, 6).astype(int)
         fold_qwk = quadratic_weighted_kappa(np.array(va_scores), fold_preds)
@@ -737,6 +814,8 @@ def train_single_model(train_input_ids, train_attention_masks, scores_list, toke
         del model, optimizer, scheduler, scaler, best_state
         gc.collect()
         torch.cuda.empty_cache()
+
+    test_probs = test_probs_sum / config.n_folds  # average of the N fold models
 
     # Optimize thresholds on full OOF
     oof_cont = probabilities_to_scores(oof_probs)
@@ -749,62 +828,7 @@ def train_single_model(train_input_ids, train_attention_masks, scores_list, toke
     print(f"Thresholds: {np.round(thresholds, 4)}")
     print(f"{'='*50}")
 
-    return oof_probs, thresholds, oof_qwk
-
-
-# ============================================================
-# Test Prediction
-# ============================================================
-
-
-def train_full_and_predict(train_input_ids, train_attention_masks, scores_list,
-                           test_input_ids, test_attention_masks, config, tokenizer):
-    """Train on full dataset and predict on test (uses pre-tokenized data)."""
-    set_seed(config.seed)
-    collate = make_collate_fn(tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0)
-
-    train_scores = [s - 1 for s in scores_list]  # 1-6 → 0-5
-    train_dataset = EssayDataset(train_input_ids, train_attention_masks, train_scores)
-    test_dataset = EssayDataset(test_input_ids, test_attention_masks)
-
-    eff_bs = config.batch_size * config.world_size
-    train_loader = DataLoader(
-        train_dataset, batch_size=eff_bs, shuffle=True,
-        num_workers=config.num_workers, pin_memory=True, collate_fn=collate,
-    )
-    test_loader = DataLoader(
-        test_dataset, batch_size=eff_bs * 2, shuffle=False,
-        num_workers=config.num_workers, pin_memory=True, collate_fn=collate,
-    )
-
-    model = EssayScoringModel(config.model_name, config.num_classes,
-                              gradient_checkpointing=config.gradient_checkpointing)
-    model.backbone.resize_token_embeddings(len(tokenizer))
-    model = model.float()
-    model.to(config.device)
-    model = wrap_data_parallel(model, config)
-    if config.device.type == "cuda":
-        torch.cuda.synchronize()
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
-    total_steps = len(train_loader) * config.epochs // config.gradient_accumulation_steps
-    warmup_steps = int(total_steps * config.warmup_ratio)
-    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
-
-    criterion = CombinedLoss(ce_weight=0.7, qwk_weight=0.3)
-    scaler = GradScaler("cuda") if (config.use_amp and config.device.type == "cuda") else None
-
-    for epoch in range(config.epochs):
-        train_loss = train_one_epoch(model, train_loader, optimizer, scheduler, criterion, scaler, config)
-        print(f"Full-train Epoch {epoch + 1}: train_loss={train_loss:.4f}")
-
-    test_probs = predict(model, test_loader, config)
-
-    del model
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    return test_probs
+    return oof_probs, test_probs, thresholds, oof_qwk
 
 
 # ============================================================
@@ -815,12 +839,12 @@ def train_full_and_predict(train_input_ids, train_attention_masks, scores_list,
 def run_ensemble(train_df, test_df, config):
     """
     Train ensemble of models with different seeds.
-    Tokenizes ONCE (shared across seeds), then per seed: 5-fold CV (OOF) + full-train (test preds).
-    Saves incremental predictions + a submittable CSV after EVERY seed, so a long run
-    always leaves something usable on disk even if Kaggle disconnects.
+    Tokenizes ONCE (shared across seeds), then per seed: N-fold CV produces both OOF
+    (for thresholds/score estimate) AND test predictions (averaged across the N fold
+    models — no separate full-data retrain). Saves a submittable CSV after EVERY seed.
     """
     print(f"\n{'#'*60}")
-    print(f"ENSEMBLE TRAINING — {len(config.ensemble_seeds)} seeds")
+    print(f"ENSEMBLE TRAINING — {len(config.ensemble_seeds)} seeds × {config.n_folds} folds")
     print(f"Model: {config.model_name}")
     print(f"{'#'*60}")
 
@@ -848,14 +872,12 @@ def run_ensemble(train_df, test_df, config):
         print(f"{'*'*50}")
 
         config.seed = seed
-        oof_probs, _, oof_qwk = train_single_model(train_ids, train_masks, scores_list, tokenizer, config)
-        all_oof_probs.append(oof_probs)
-        oof_qwks.append(oof_qwk)
-
-        test_probs = train_full_and_predict(
-            train_ids, train_masks, scores_list, test_ids, test_masks, config, tokenizer
+        oof_probs, test_probs, _, oof_qwk = train_single_model(
+            train_ids, train_masks, scores_list, test_ids, test_masks, tokenizer, config
         )
+        all_oof_probs.append(oof_probs)
         all_test_probs.append(test_probs)
+        oof_qwks.append(oof_qwk)
 
         # ---- Incremental checkpoint: save raw probs + a submittable CSV with seeds so far ----
         ckpt_dir = os.path.join(config.output_dir, "checkpoints")
@@ -998,11 +1020,17 @@ def main():
     # ===== Apply EDIT block (top of file) — the default source of truth =====
     if EDIT_PRESET == "smoke":
         config.smoke = True
+        config.gradient_checkpointing = False  # tiny data, not needed
+    elif EDIT_PRESET in ("fast", "base"):
+        # DeBERTa-v3-base fits on T4 WITHOUT gradient checkpointing now that we use
+        # dynamic padding (most batches are short) → ~1.5x faster than checkpointing.
+        config.gradient_checkpointing = False
     elif EDIT_PRESET == "large":
         config.model_name = "microsoft/deberta-v3-large"
         config.batch_size = 2  # per-GPU micro-batch (memory-safe on T4)
-    elif EDIT_PRESET != "base":
-        raise ValueError(f'EDIT_PRESET 必须是 "smoke"/"base"/"large"，当前: {EDIT_PRESET}')
+        config.gradient_checkpointing = True  # large needs checkpointing on T4
+    else:
+        raise ValueError(f'EDIT_PRESET 必须是 "smoke"/"fast"/"base"/"large"，当前: {EDIT_PRESET}')
 
     if not config.smoke:
         config.ensemble_seeds = tuple(EDIT_SEEDS)
@@ -1023,6 +1051,7 @@ def main():
     if args.model == "large":
         config.model_name = "microsoft/deberta-v3-large"
         config.batch_size = 2
+        config.gradient_checkpointing = True
     if args.batch_size:
         config.batch_size = args.batch_size
     if args.epochs:
@@ -1042,20 +1071,17 @@ def main():
 
     # Environment-specific path adjustments
     if _KAGGLE:
+        # Kaggle: force writable /kaggle/working paths (input data is read-only under /kaggle/input)
+        config.data_dir = "/kaggle/input/datasets/arkria/lalaes2"
+        config.output_dir = "/kaggle/working"
+        config.submission_file = "/kaggle/working/submission.csv"
         if not os.path.exists(config.data_dir):
             print(f"WARNING: Kaggle data path not found: {config.data_dir}")
     else:
-        # Local: auto-detect data path (only if user didn't explicitly set --data/--output)
+        # Local/4090 box: keep relative paths; just warn if data missing.
         if not os.path.exists(config.data_dir):
-            local_path = "./data"
-            if os.path.exists(local_path):
-                config.data_dir = local_path
-                if not args.output:
-                    config.output_dir = "."
-                    config.submission_file = "submission.csv"
-                print(f"Using local data: {local_path}")
-            else:
-                print(f"WARNING: Data directory not found. Specify with --data flag.")
+            print(f"WARNING: Data directory not found: {config.data_dir} "
+                  f"(expected ./data with train.csv/test.csv). Use --data to override.")
 
     # Create output directory
     os.makedirs(config.output_dir, exist_ok=True)
@@ -1087,6 +1113,21 @@ def main():
         except AttributeError:
             mem = torch.cuda.get_device_properties(0).total_mem / 1e9  # older torch
         print(f"CUDA memory:    {mem:.1f} GB per GPU")
+
+        # --- Memory-aware tuning for large model (only if user didn't force EDIT_BATCH_SIZE) ---
+        is_large = "large" in config.model_name
+        if is_large and EDIT_BATCH_SIZE is None:
+            if mem >= 22:  # 4090 (24GB), A100, etc.
+                # batch 4 needs checkpointing ON even on 24GB — long (1024-token)
+                # batches spike activation memory. Checkpointing keeps it safe and
+                # batch 4 still utilizes the GPU well.
+                config.batch_size = 8
+                config.gradient_checkpointing = True
+                print(f"Large model on {mem:.0f}GB GPU → batch=4, checkpointing ON")
+            else:  # T4 (16GB)
+                config.batch_size = 2
+                config.gradient_checkpointing = True
+                print(f"Large model on {mem:.0f}GB GPU → batch=2, checkpointing ON (memory-safe)")
         try:
             t = torch.zeros(1, device=config.device)
             torch.cuda.synchronize()
